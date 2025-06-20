@@ -1,4 +1,4 @@
-package util
+package main
 
 import (
 	"crypto/rsa"
@@ -11,6 +11,7 @@ import (
 	"github.com/consensys/gnark/test"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
+	"jwtZkp/cmd/util"
 	"log"
 	"math/big"
 	"testing"
@@ -18,7 +19,7 @@ import (
 )
 
 func TestJWTRSACircuit_Define_ValidTokenSucceeds(t *testing.T) {
-	pk, cert, _, err := GenerateSelfSignedCertAndKey(2048)
+	pk, cert, _, err := util.GenerateSelfSignedCertAndKey(2048)
 	if err != nil {
 		panic(err)
 	}
@@ -70,7 +71,7 @@ func TestJWTRSACircuit_Define_ValidTokenSucceeds(t *testing.T) {
 
 	// Step 2: Encode the hash with its ASN.1 DER prefix to create the DigestInfo
 	// T = ASN.1_DER_Prefix || Hashed_Message
-	digestInfo := append(Sha256ASNDERPrefix, hashedMessage...)
+	digestInfo := append(util.Sha256ASNDERPrefix, hashedMessage...)
 
 	// Step 3: Construct the expected EMSA-PKCS1-v1_5 encoded message
 	// EM = 0x00 || 0x01 || PS || 0x00 || T
@@ -114,7 +115,7 @@ func TestJWTRSACircuit_Define_ValidTokenSucceeds(t *testing.T) {
 }
 
 func TestJWTRSACircuit_Define_InValidTokenFails(t *testing.T) {
-	pk, cert, _, err := GenerateSelfSignedCertAndKey(2048)
+	pk, cert, _, err := util.GenerateSelfSignedCertAndKey(2048)
 	if err != nil {
 		panic(err)
 	}
@@ -173,7 +174,7 @@ func TestJWTRSACircuit_Define_InValidTokenFails(t *testing.T) {
 
 	// Step 2: Encode the hash with its ASN.1 DER prefix to create the DigestInfo
 	// T = ASN.1_DER_Prefix || Hashed_Message
-	digestInfo := append(Sha256ASNDERPrefix, hashedMessage...)
+	digestInfo := append(util.Sha256ASNDERPrefix, hashedMessage...)
 
 	// Step 3: Construct the expected EMSA-PKCS1-v1_5 encoded message
 	// EM = 0x00 || 0x01 || PS || 0x00 || T

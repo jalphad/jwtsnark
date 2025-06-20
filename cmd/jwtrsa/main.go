@@ -1,247 +1,251 @@
 package main
 
 import (
-	"crypto"
-	"crypto/rand"
+	"bytes"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
-	// "encoding/pem" // Uncomment if you use exportPrivateKeyAsPEM/exportPublicKeyAsPEM
+	"errors"
 	"fmt"
+	"github.com/consensys/gnark/constraint"
+	"log"
 	"math/big"
 	"os"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/groth16"
+	groth16bn254 "github.com/consensys/gnark/backend/groth16/bn254"
+	//groth16bls12381 "github.com/consensys/gnark/backend/groth16/bls12-381"
+	cs2 "github.com/consensys/gnark/constraint/bn254"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	gnarklogger "github.com/consensys/gnark/logger"
+	"github.com/consensys/gnark/std/math/emulated"
+	"github.com/consensys/gnark/std/math/emulated/emparams"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/rs/zerolog"
+	"jwtZkp/cmd/util"
 )
-
-// JWTRSACircuit defines the RSA signature verification circuit.
-// It proves that a given signature is valid for a given message hash and public key,
-// without revealing the signature itself.
-type JWTRSACircuit struct {
-	// --- Public Inputs ---
-
-	// HashedMessage is the SHA256 hash of the (header_b64.payload_b64) string.
-	// It's represented as an array of frontend.Variable, where each Variable is a byte of the hash.
-	// For SHA256, this will be 32 bytes.
-	HashedMessage [32]frontend.Variable `gnark:",public"`
-
-	// PublicKeyN is the modulus N of the RSA public key.
-	PublicKeyN frontend.Variable `gnark:",public"`
-
-	// PublicKeyE is the public exponent E of the RSA public key (e.g., 65537).
-	PublicKeyE frontend.Variable `gnark:",public"`
-
-	// --- Private Inputs (Witness) ---
-
-	// Signature is an array of frontend.Variable, where each Variable is a byte of the RSA signature.
-	// The size must match the RSA key size in bytes (e.g., 256 for RSA-2048).
-	Signature [256]frontend.Variable // Assuming a 2048-bit RSA key (2048/8 = 256 bytes)
-}
-
-// Define the circuit logic using the gnark frontend API.
-func (circuit *JWTRSACircuit) Define(api frontend.API) error {
-	// Prepare the public key structure for gnark's RSA library.
-	publicKey := gnarkrsa.PublicKey{
-		N: circuit.PublicKeyN,
-		E: circuit.PublicKeyE, // E is typically small (e.g., 65537)
-	}
-
-	// Convert HashedMessage from [32]frontend.Variable to []frontend.Variable
-	// as expected by the gnarkrsa.Verify function.
-	hashedMessageSlice := make([]frontend.Variable, len(circuit.HashedMessage))
-	hashedMessageSlice = circuit.HashedMessage[:]
-
-	// Convert Signature from [256]frontend.Variable to []frontend.Variable.
-	signatureSlice := make([]frontend.Variable, len(circuit.Signature))
-	signatureSlice = circuit.Signature[:]
-
-	// Perform RSA PKCS#1v1.5 signature verification.
-	// The gnarkrsa.Verify function handles:
-	// 1. Constructing the DigestInfo (ASN.1 structure containing hash algorithm ID and hash).
-	// 2. EMSA-PKCS1-v1_5 padding.
-	// 3. Modular exponentiation (signature^E mod N).
-	// 4. Comparison with the padded hash.
-	// We provide the raw SHA256 hash; the function uses crypto.SHA256 to know how to format DigestInfo.
-	err := gnarkrsa.Verify(api, publicKey, signatureSlice, hashedMessageSlice, &gnarkrsa.Options{
-		Hash: crypto.SHA256, // Specify the hash algorithm used outside the circuit.
-		// RSASignatureScheme defaults to PKCS1v15 if not specified.
-	})
-	if err != nil {
-		return fmt.Errorf("RSA verification failed within circuit: %w", err)
-	}
-
-	return nil
-}
-
-// --- Helper Functions ---
-
-// generateSelfSignedCertAndKey creates a sample RSA private key and a self-signed X.509 certificate.
-// In a real scenario, the JWT issuer generates these. The x5c field contains the certificate.
-func generateSelfSignedCertAndKey(rsaBits int) (*rsa.PrivateKey, *x509.Certificate, []byte /*DER bytes*/, error) {
-	privKey, err := rsa.GenerateKey(rand.Reader, rsaBits)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to generate RSA private key: %w", err)
-	}
-
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			CommonName:   "jwt-issuer.example.com",
-			Organization: []string{"Example JWT Issuer"},
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().Add(time.Hour * 24 * 365), // Valid for 1 year
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}, // Example usages
-		BasicConstraintsValid: true,
-		IsCA:                  false, // Not a CA certificate
-	}
-
-	// Create the certificate, signed by the private key itself (self-signed).
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &privKey.PublicKey, privKey)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to create certificate: %w", err)
-	}
-
-	cert, err := x509.ParseCertificate(derBytes)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("failed to parse created certificate: %w", err)
-	}
-
-	return privKey, cert, derBytes, nil
-}
-
-// --- Main Program ---
 
 func main() {
 	// Configure gnark logger (optional, useful for debugging)
-	gnarklogger.SetSeverity(gnarklogger.INFO) // Or ERROR for less verbosity
+	logger := zerolog.Logger{}
+	logger.Level(zerolog.InfoLevel)
+	gnarklogger.Set(logger)
 
-	// 1. Simulate JWT data and x5c certificate
-	// For a real JWT, the 'signedData' is: base64urlEncode(header) + "." + base64urlEncode(payload)
-	// Example header: {"alg":"RS256","typ":"JWT"} -> eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9
-	// Example payload: {"sub":"user123","name":"John Doe"} -> eyJzdWIiOiJ1c2VyMTIzIiwibmFtZSI6IkpvaG4gRG9lIn0
-	// signedData := "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyMTIzIiwibmFtZSI6IkpvaG4gRG9lIn0"
-	// For this example, we'll use a simpler string.
-	signedData := "This is the data that was signed in the JWT (header.payload)."
-	fmt.Printf("📜 JWT Signed Data (simulated): \"%s\"\n", signedData)
-
-	// RSA key size (must match circuit's Signature array size)
-	rsaKeyBits := 2048
-	expectedSignatureSize := rsaKeyBits / 8
-	if expectedSignatureSize != len(JWTRSACircuit{}.Signature) {
-		fmt.Printf("❌ Configuration Error: RSA key size (%d bits) implies signature size %d, but circuit expects %d.\n",
-			rsaKeyBits, expectedSignatureSize, len(JWTRSACircuit{}.Signature))
-		os.Exit(1)
-	}
-
-	// Generate a sample RSA private key and its corresponding X.509 certificate (DER encoded).
-	// The prover would possess the private key. The certificate (or its public key) is public.
-	fmt.Println("\n🔑 Generating RSA key pair and self-signed certificate for simulation...")
-	jwtSignerPrivKey, _, certDERBytes, err := generateSelfSignedCertAndKey(rsaKeyBits)
+	privateKey, cert, _, err := util.GenerateSelfSignedCertAndKey(2048)
 	if err != nil {
-		fmt.Printf("❌ Error generating sample key/cert: %v\n", err)
-		os.Exit(1)
+		panic(err)
 	}
 
-	// The 'x5c' field in a JWT header (or JWKS) would contain this certificate, base64-encoded.
-	x5cValue := base64.StdEncoding.EncodeToString(certDERBytes)
-	fmt.Printf("📄 Simulated x5c certificate value (first 60 chars): %s...\n", x5cValue[:60])
+	timeNow := fmt.Sprintf("%d", time.Now().Unix())
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+		"sub":  "foo",
+		"user": "John Doe",
+		"id":   "abc123",
+		"iat":  timeNow,
+	})
 
-	// 2. Parse the x5c certificate to extract the public key (N, E)
-	// This is what a verifier (or our circuit setup) would do.
-	fmt.Println("\n🔍 Parsing x5c certificate to extract public key...")
-	decodedCertBytes, err := base64.StdEncoding.DecodeString(x5cValue)
+	signed, err := token.SignedString(privateKey)
 	if err != nil {
-		fmt.Printf("❌ Error base64-decoding x5c string: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("failed to sign token: %s", err.Error())
 	}
-	parsedCert, err := x509.ParseCertificate(decodedCertBytes)
+
+	// 2. Parse and verify the JWT
+	parsed, err := jwt.Parse(signed, func(token *jwt.Token) (interface{}, error) {
+		// Don't forget to validate the alg is what you expect:
+		if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return cert.PublicKey, nil
+	})
+
 	if err != nil {
-		fmt.Printf("❌ Error parsing DER certificate from x5c: %v\n", err)
-		os.Exit(1)
+		if errors.Is(err, jwt.ErrTokenExpired) {
+			log.Println("Token has expired.")
+		} else if errors.Is(err, jwt.ErrTokenNotValidYet) {
+			log.Println("Token not yet valid.")
+		} else if errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+			log.Println("Token signature is invalid.")
+		} else {
+			log.Fatalf("Error parsing token: %v", err)
+		}
+		return
 	}
-	rsaPublicKey, ok := parsedCert.PublicKey.(*rsa.PublicKey)
-	if !ok {
-		fmt.Println("❌ Certificate does not contain an RSA public key.")
-		os.Exit(1)
+
+	message, _ := token.SigningString()
+	pubKey := cert.PublicKey.(*rsa.PublicKey)
+	publicKeyN := pubKey.N
+	publicKeyE := pubKey.E
+
+	// Step 1: Hash the message using SHA-256
+	hasher := sha256.New()
+	hasher.Write([]byte(message)) // This Write never returns an error
+	hashedMessage := hasher.Sum(nil)
+
+	// Step 2: Encode the hash with its ASN.1 DER prefix to create the DigestInfo
+	// T = ASN.1_DER_Prefix || Hashed_Message
+	digestInfo := append(util.Sha256ASNDERPrefix, hashedMessage...)
+
+	// Step 3: Construct the expected EMSA-PKCS1-v1_5 encoded message
+	// EM = 0x00 || 0x01 || PS || 0x00 || T
+	// k is the length of the modulus in bytes
+	k := publicKeyN.BitLen() / 8
+
+	// The length of T (DigestInfo)
+	lenT := len(digestInfo)
+
+	// Check if k is large enough for EM: 0x00 || 0x01 || PS (min 8 bytes) || 0x00 || T
+	// This means k must be at least len(T) + 3 (for 00,01,00) + 8 (min PS length) = len(T) + 11
+	if k < lenT+11 {
+		logger.Fatal().Msgf("key modulus bit length %d is too short for message and padding (need at least %d bytes, got %d)", publicKeyN.BitLen(), lenT+11, k)
 	}
-	publicKeyN := rsaPublicKey.N
-	publicKeyE := big.NewInt(int64(rsaPublicKey.E)) // E is typically 65537
 
-	fmt.Printf("    Modulus N (first 16 bytes): %x...\n", publicKeyN.Bytes()[:16])
-	fmt.Printf("    Exponent E: %d\n", rsaPublicKey.E)
+	// PS is a string of (k - len(T) - 3) bytes, all 0xFF.
+	psLen := k - lenT - 3
+	// psLen must be at least 8 bytes according to PKCS#1 v1.5 spec.
+	// This was implicitly checked by `k < lenT + 11` if lenT + 11 is the minimum k size.
 
-	// 3. Hash the signed data (using SHA-256, as in RS256)
-	// This hash is a public input to our zk-SNARK circuit.
-	fmt.Println("\n#️⃣ Hashing the JWT signed data (SHA-256)...")
-	hashedData := sha256.Sum256([]byte(signedData))
-	fmt.Printf("    Hash (hex): %x\n", hashedData)
-
-	// 4. Create the RSA signature (Prover's action)
-	// This signature is the private witness for the zk-SNARK.
-	fmt.Println("\n✍️  Creating RSA signature (PKCS#1v1.5) with the private key...")
-	signatureBytes, err := rsa.SignPKCS1v15(rand.Reader, jwtSignerPrivKey, crypto.SHA256, hashedData[:])
-	if err != nil {
-		fmt.Printf("❌ Error signing hash: %v\n", err)
-		os.Exit(1)
+	// Construct EM = 0x00 || 0x01 || PS || 0x00 || T
+	expectedEM := make([]byte, k)
+	expectedEM[0] = 0x00
+	expectedEM[1] = 0x01 // Block type 01 for signature
+	for i := 0; i < psLen; i++ {
+		expectedEM[2+i] = 0xff // Padding string
 	}
-	fmt.Printf("    Signature (first 16 bytes): %x...\n", signatureBytes[:16])
-
-	// Sanity check: Verify signature using standard crypto library (outside ZK)
-	err = rsa.VerifyPKCS1v15(rsaPublicKey, crypto.SHA256, hashedData[:], signatureBytes)
-	if err != nil {
-		fmt.Printf("❌ Standard library RSA verification FAILED (sanity check): %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("    ✅ Standard library RSA verification successful (sanity check).")
+	expectedEM[2+psLen] = 0x00 // Separator
+	copy(expectedEM[2+psLen+1:], digestInfo)
+	emPrime := new(big.Int).SetBytes(expectedEM)
 
 	// 5. Prepare inputs for the gnark circuit
 	var circuit JWTRSACircuit
 
 	// Populate public inputs
-	for i := 0; i < len(hashedData); i++ {
-		circuit.HashedMessage[i] = hashedData[i]
-	}
-	circuit.PublicKeyN = publicKeyN
-	circuit.PublicKeyE = publicKeyE
+	circuit.EmPrime = emulated.ValueOf[emparams.Mod1e4096](emPrime)
+	circuit.PublicKeyN = emulated.ValueOf[emparams.Mod1e4096](publicKeyN)
+	circuit.PublicKeyE = emulated.ValueOf[emparams.Mod1e4096](publicKeyE)
 
 	// Populate private inputs (the signature)
-	if len(signatureBytes) != len(circuit.Signature) {
-		fmt.Printf("❌ Error: Generated signature length (%d) does not match circuit's expected length (%d).\n",
-			len(signatureBytes), len(circuit.Signature))
-		os.Exit(1)
-	}
-	for i := 0; i < len(signatureBytes); i++ {
-		circuit.Signature[i] = signatureBytes[i]
+	circuit.Signature = emulated.ValueOf[emparams.Mod1e4096](new(big.Int).SetBytes(parsed.Signature))
+
+	var cs constraint.ConstraintSystem
+	var rsaCircuitPath = "./rsaCircuit"
+	if _, err = os.Stat(rsaCircuitPath); errors.Is(err, os.ErrNotExist) {
+		// 6. Compile the circuit
+		fmt.Println("\n⚙️ Compiling the gnark circuit...")
+		cs, err = frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
+		if err != nil {
+			fmt.Printf("❌ Error compiling circuit: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("    ✅ Circuit compiled successfully. Number of constraints: %d\n", cs.GetNbConstraints())
+		f, err := os.Create(rsaCircuitPath)
+		if err != nil {
+			fmt.Printf("❌ Error creating provingKey file: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n⚙️ Writing the gnark circuit to disk...")
+		buf := bytes.NewBuffer([]byte{})
+		_, err = cs.WriteTo(buf)
+		if err != nil {
+			fmt.Printf("❌ Error writing circuit to buffer: %v\n", err)
+			os.Exit(1)
+		}
+		_, err = f.Write(buf.Bytes())
+		if err != nil {
+			fmt.Printf("❌ Error writing buffer to %s: %v\n", rsaCircuitPath, err)
+			os.Exit(1)
+		}
+	} else {
+		fmt.Println("\n⚙️ Reading the gnark circuit from disk...")
+		csBytes, err := os.ReadFile(rsaCircuitPath)
+		if err != nil {
+			fmt.Printf("❌ Error reading ./provingKey: %v\n", err)
+			os.Exit(1)
+		}
+		rdr := bytes.NewReader(csBytes)
+		cs = &cs2.R1CS{}
+		_, err = cs.ReadFrom(rdr)
+		if err != nil {
+			fmt.Printf("❌ Error reading proving key from bytes: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
-	// 6. Compile the circuit
-	fmt.Println("\n⚙️ Compiling the gnark circuit...")
-	cs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
-	if err != nil {
-		fmt.Printf("❌ Error compiling circuit: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("    ✅ Circuit compiled successfully. Number of constraints: %d\n", cs.GetNbConstraints())
+	var pk groth16.ProvingKey
+	var vk groth16.VerifyingKey
+	if _, err = os.Stat("./provingKey"); errors.Is(err, os.ErrNotExist) {
+		// 7. Perform Groth16 Setup (generate Proving Key and Verifying Key)
+		// This is a one-time setup for a given circuit structure.
+		fmt.Println("\n🛠️ Running Groth16 setup (generating PK and VK)...")
+		pk, vk, err = groth16.Setup(cs)
+		if err != nil {
+			fmt.Printf("❌ Error in Groth16 setup: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("    ✅ Groth16 setup complete.")
+		f, err := os.Create("./provingKey")
+		if err != nil {
+			fmt.Printf("❌ Error creating provingKey file: %v\n", err)
+			os.Exit(1)
+		}
+		buf := bytes.NewBuffer([]byte{})
+		_, err = pk.WriteTo(buf)
+		if err != nil {
+			fmt.Printf("❌ Error writing proving key to buffer: %v\n", err)
+			os.Exit(1)
+		}
+		_, err = f.Write(buf.Bytes())
+		if err != nil {
+			fmt.Printf("❌ Error writing buffer to ./provingKey: %v\n", err)
+			os.Exit(1)
+		}
 
-	// 7. Perform Groth16 Setup (generate Proving Key and Verifying Key)
-	// This is a one-time setup for a given circuit structure.
-	fmt.Println("\n🛠️ Running Groth16 setup (generating PK and VK)...")
-	pk, vk, err := groth16.Setup(cs)
-	if err != nil {
-		fmt.Printf("❌ Error in Groth16 setup: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("    ✅ Groth16 setup complete.")
+		f, err = os.Create("./verifyingKey")
+		if err != nil {
+			fmt.Printf("❌ Error creating verifyingKey file: %v\n", err)
+			os.Exit(1)
+		}
+		buf = bytes.NewBuffer([]byte{})
+		_, err = vk.WriteTo(buf)
+		if err != nil {
+			fmt.Printf("❌ Error writing verification key to buffer: %v\n", err)
+			os.Exit(1)
+		}
+		_, err = f.Write(buf.Bytes())
+		if err != nil {
+			fmt.Printf("❌ Error writing buffer to ./verifyingKey: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		fmt.Println("\n🛠️ Reading Groth16 PK and VK from disk...")
+		pkBytes, err := os.ReadFile("./provingKey")
+		if err != nil {
+			fmt.Printf("❌ Error reading ./provingKey: %v\n", err)
+			os.Exit(1)
+		}
+		pk = &groth16bn254.ProvingKey{}
+		_, err = pk.ReadFrom(bytes.NewReader(pkBytes))
+		if err != nil {
+			fmt.Printf("❌ Error reading proving key from bytes: %v\n", err)
+			os.Exit(1)
+		}
 
+		vkBytes, err := os.ReadFile("./verifyingKey")
+		if err != nil {
+			fmt.Printf("❌ Error reading ./verifyingKey: %v\n", err)
+			os.Exit(1)
+		}
+		vk = &groth16bn254.VerifyingKey{}
+		_, err = vk.ReadFrom(bytes.NewReader(vkBytes))
+		if err != nil {
+			fmt.Printf("❌ Error reading veryfying key from bytes: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	start := time.Now()
 	// 8. Create a witness
 	// The witness includes all inputs: public (hash, N, E) and private (signature).
 	fmt.Println("\n📦 Creating witness for the prover...")
@@ -250,11 +254,7 @@ func main() {
 		fmt.Printf("❌ Error creating witness: %v\n", err)
 		os.Exit(1)
 	}
-	publicWitness, err := witness.Public()
-	if err != nil {
-		fmt.Printf("❌ Error creating public witness: %v\n", err)
-		os.Exit(1)
-	}
+	fmt.Println("Creating the witness took: " + time.Since(start).String())
 	fmt.Println("    ✅ Witness created.")
 
 	// 9. Generate the Proof (Prover's task)
@@ -265,7 +265,23 @@ func main() {
 		fmt.Printf("❌ Error generating proof: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Println("Proof generation took: " + time.Since(start).String())
 	fmt.Println("    ✅ Proof generated successfully.")
+	buf := bytes.NewBuffer([]byte{})
+	_, err = proof.WriteTo(buf)
+	if err != nil {
+		fmt.Printf("❌ Error writing verification key to buffer: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("\n The proof: " + base64.StdEncoding.EncodeToString(buf.Bytes()))
+
+	fmt.Println("\n📦 Creating public witness for the verifier...")
+	publicWitness, err := witness.Public()
+	if err != nil {
+		fmt.Printf("❌ Error creating public witness: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("    ✅ Public witness created.")
 
 	// 10. Verify the Proof (Verifier's task)
 	// The verifier uses the Verifying Key (vk) and only the Public Witness.

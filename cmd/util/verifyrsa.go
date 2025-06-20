@@ -8,7 +8,7 @@ import (
 	"math/big"
 )
 
-// sha256ASNDERPrefix is the ASN.1 DER prefix for a SHA-256 DigestInfo structure.
+// Sha256ASNDERPrefix is the ASN.1 DER prefix for a SHA-256 DigestInfo structure.
 //
 //	DigestInfo ::= SEQUENCE {
 //	  digestAlgorithm AlgorithmIdentifier { OID sha256 },
@@ -16,7 +16,7 @@ import (
 //	}
 //
 // The prefix is: 3031300d060960864801650304020105000420
-var sha256ASNDERPrefix = []byte{
+var Sha256ASNDERPrefix = []byte{
 	0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, // OID for SHA-256
 	0x05, 0x00, // NULL parameters
 	0x04, 0x20, // OCTET STRING tag and length for a 32-byte hash
@@ -48,7 +48,7 @@ func VerifyRSASignaturePKCS1v15(
 
 	// Step 2: Encode the hash with its ASN.1 DER prefix to create the DigestInfo
 	// T = ASN.1_DER_Prefix || Hashed_Message
-	digestInfo := append(sha256ASNDERPrefix, hashedMessage...)
+	digestInfo := append(Sha256ASNDERPrefix, hashedMessage...)
 
 	// Step 3: Construct the expected EMSA-PKCS1-v1_5 encoded message
 	// EM = 0x00 || 0x01 || PS || 0x00 || T
